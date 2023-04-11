@@ -1,0 +1,493 @@
+---
+title: "Creating an array of linear regression models to estimate potential evapotranspiration"
+author: "Aiya Ishmanova, Valeria Shaidullina, Georgy Kvetenadze, Salome Khrikadze"
+date: "4/10/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+
+```{r}
+library(ggplot2)
+library(hydroGOF)
+library(plotly)
+library(broom)
+library(Metrics)
+library(randomForestExplainer)
+library(rsq)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(knitr)
+library(lubridate)
+install.packages('caret')
+dir_path <- 'C:/R/lec/R/R/'
+
+evap_data <- readRDS("evap_data_ewm_floating.rds")
+evap_st_info <- readRDS('evaporimeter_stations.rds')
+evap_st_info <- st_drop_geometry(evap_st_info)
+nasa_data <- readRDS('nasa_gldas_noah_v21_group2_raw.rds')
+```
+
+#TASK 1
+#The code is loading the required packages for data wrangling, data visualization,
+#model evaluation, and hydrological analysis. It then sets the working directory and
+#loads the necessary data for the analysis. The task then filters for EWM type stations
+#in group2, selects the numeric columns, filters for stations in st_list, and drops unnecessary
+#columns. Finally, it prints st_list and obs_vars_cols
+
+```{r}
+# Filter for EWM type stations in group2
+st_list <- evap_st_info %>% 
+  filter(type == 'EWM', group == 'group2') %>% 
+  pull(id)
+
+# Select numeric columns
+obs_vars_cols <- evap_data %>% 
+  select_if(is.numeric) %>% 
+  colnames()
+
+# Filter for stations in st_list and drop unnecessary columns
+evap_data <- evap_data %>% 
+  filter(id %in% st_list) %>% 
+  select(-c(R, Tw, evaporimeter_type)) %>% 
+  drop_na()
+
+# Print st_list and obs_vars_cols
+print(st_list)
+print(obs_vars_cols)
+
+```
+
+
+
+#TASK 2
+#The code is getting the observation dates of the evap data, splitting the data into
+#a calibration and validation set based on observation dates, and printing the length
+#of unique ids in the calibration set.
+```{r}
+Get the observation dates of the evap data
+obs_dates <- evap_data %>%
+  pull(obs_date)
+
+# Split the data into a calibration and validation set based on observation dates
+evap_data_calib <- evap_data %>%
+  filter(obs_date < '2012-01-01')
+
+# date inconsistency
+length(unique(evap_data_calib$id))
+
+evap_data_valid <- evap_data %>%
+  filter(obs_date >= '2012-01-01',
+         id %in% unique(evap_data_calib$id))
+
+```
+
+
+#TASK 3
+#The code is loading data from the NASA file, converting the date to date format,
+#selecting a subset of data for calibration, investigating the relationships between
+#variables, creating a correlation matrix, subsetting data and creating scatter plots
+#to investigate relationships, identifying and removing outliers, and creating a list
+#of potential models to evaluate.
+```{r}
+# convert date to date format
+evap_data$obs_date <- ymd(evap_data$obs_date)
+
+summary(evap_data[, c("PET", "Ta", "V", "P", "SSV", "id")])
+
+# Investigate relationships between variables
+evap_data_calib_corr <- evap_data_calib %>%
+  select(-id, -obs_date) %>%
+  na.omit() %>%
+  cor() %>%
+  as.data.frame() %>%
+  mutate(variable1 = rownames(.)) %>%
+  gather(variable2, correlation, -variable1) %>%
+  filter(correlation != 1)
+
+```
+
+
+```{r}
+# Plot correlation matrix
+ggplot(evap_data_calib_corr, aes(variable1, variable2)) +
+  geom_tile(aes(fill = correlation)) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 1,
+                                   size = 10, hjust = 1)) +
+  labs(title = "Correlation matrix for calibration data",
+       subtitle = "Variables with high correlation might be redundant or multicollinear")
+
+# subset data and create scatterplots to investigate relationships
+
+ggplot(evap_data_calib, aes(x = 'Tamax', y = PET)) +
+  geom_point()
+
+ggplot(evap_data_calib, aes(x = V, y = PET)) +
+  geom_point()
+
+ggplot(evap_data_calib, aes(x = P, y = PET)) +
+  geom_point()
+
+ggplot(evap_data_calib, aes(x = SSV, y = PET)) +
+  geom_point()
+
+ggplot(evap_data_calib, aes(x = id, y = PET)) +
+  geom_point()
+```
+ 
+ 
+```{r}
+# identify and remove outliers
+pet_sd <- sd(evap_data_calib$PET)
+pet_mean <- mean(evap_data_calib$PET)
+evap_data_calib <- evap_data_calib %>%
+  filter(PET >= (pet_mean - 3 * pet_sd), PET <= (pet_mean + 3 * pet_sd))
+
+# create list of potential models to evaluate
+model_list <- list(
+  lm(PET ~ Ta + V, data = evap_data_calib),
+  lm(PET ~ Ta + V + P, data = evap_data_calib),
+  lm(PET ~ Ta + V + P + SSV, data = evap_data_calib),
+  lm(PET ~ Ta + V + P + SSV + id, data = evap_data_calib),
+  glm(PET ~ Ta + V + P, data = evap_data_calib, family = "poisson"),
+  glm(PET ~ Ta + V + P + SSV, data = evap_data_calib, family = "poisson")
+```
+
+
+```{r}
+# define RMSE function
+RMSE <- function(pred, obs) {
+  sqrt(mean((pred - obs)^2))
+}
+
+# evaluate models using AIC, BIC, and RMSE
+model_evaluations <- sapply(model_list, function(model) {
+  aic <- AIC(model)
+  bic <- BIC(model)
+  rmse <- RMSE(predict(model), evap_data_calib$PET)
+  c(AIC = aic, BIC = bic, RMSE = rmse)
+})
+
+# select best models based on AIC and BIC
+best_models <- model_list[order(model_evaluations["AIC", ])[1:3]]
+
+# add predicted values to data and create plot
+evap_data_calib <- evap_data_calib %>%
+  mutate(predicted = predict(best_models[[1]]))
+
+ggplot(evap_data_calib, aes(x = obs_date, y = PET)) +
+  geom_point() +
+  geom_line(aes(y = predicted), color = "red") 
+
+```
+
+
+
+#TASK 4
+# The code is creating a function called "performance_metrics" that takes two input
+#arguments - the observed and predicted values of a variable. The function first calculates
+#the mean absolute error (MAE) between the observed and predicted values. It then calculates
+#the root mean squared error (RMSE), the coefficient of determination (R-squared), and the
+#Nash-Sutcliffe efficiency (NSE). Finally, it returns these four metrics as a dictionary.
+
+```{r}
+# Split the data into training and validation sets
+set.seed(123)
+trainIndex <- createDataPartition(evap_data$PET, p = 0.8, list = FALSE)
+trainData <- evap_data[trainIndex, ]
+validationData <- evap_data[-trainIndex, ]
+
+# Load your best model(s)
+best_models <- model_list[order(model_evaluations["AIC", ])[1:3]]
+
+
+
+#Train the best models on the training set
+ctrl <- trainControl(method = "cv", number = 5)
+results <- list()
+for (model in best_models) {
+  if (class(model) == "lm") {
+    model_type <- "lm"
+    model_parameters <- list()
+    model_grid <- NULL
+    model_fit <- function(x, y, w, ...) {
+      fit <- lm.fit(x, y, w = w, ...)
+      list(coefficients = coef(fit), residual = fit$residuals, weights = fit$weights)
+    }
+    model_predict <- function(modelFit, newdata, ...) {
+      predict.lm(object = list(coef = modelFit$coefficients), newdata = newdata, ...)
+    }
+    model_prob <- NULL
+  } else if (class(model) == "glm") {
+    model_type <- "glm"
+    model_parameters <- list(family = model$family)
+    model_grid <- NULL
+    model_fit <- function(x, y, w, ...) {
+      glm.fit(x, y, w = w, family = model$family, ...)
+    }
+    model_predict <- function(modelFit, newdata, ...) {
+      predict.glm(object = modelFit, newdata = newdata, ...)
+    }
+    model_prob <- function(modelFit, newdata, type = "response", ...) {
+      predict.glm(object = modelFit, newdata = newdata, type = type, ...)
+    }
+  } else {
+    stop("Unsupported model type")
+  }
+  result <- train(
+    PET ~ .,
+    data = trainData,
+    method = "lm",
+    trControl = ctrl,
+    tuneGrid = model_grid,
+    metric = "RMSE",
+    methodType = model_type,
+    methodParameters = model_parameters,
+    modelFit = model_fit,
+    modelPredict = model_predict,
+    modelProb = model_prob
+  )
+  results[[deparse(substitute(model))]] <- result
+}
+
+```
+
+
+```{r}
+# Evaluate the best models on the validation set
+validationResults <- list()
+for (model in best_models) {
+  validationResults[[deparse(substitute(model))]] <- predict(results[[deparse(substitute(model))]], newdata = validationData)
+}
+
+# Quantitative evaluation
+RMSE <- sapply(validationResults, function(x) {
+  RMSE(validationData$PET, x)
+})
+print(RMSE)
+
+# Visual evaluation
+plotRMSE <- function(model) {
+  ggplot(data.frame(actual = validationData$PET, predicted = validationResults[[model]]), aes(x = actual, y = predicted)) +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(x = "Actual PET", y = "Predicted PET", title = paste0("Model: ", model))
+}
+plots <- lapply(names(validationResults), plotRMSE)
+gridExtra::grid.arrange(grobs = plots, ncol = 2)
+
+```
+
+
+
+#TASK 5
+#The code is creating a for loop that iterates over each station in the st_list,
+#and for each station, it loads the evap data and selects the relevant columns.
+#It then splits the data into calibration and validation sets based on observation
+#dates, fits a linear regression model to the calibration data, uses the model to
+#predict the evap values for the validation data, and calculates the performance metrics
+#using the "performance_metrics" function created in Task 4. It stores the performance
+#metrics in a dictionary with the station id as the key.
+
+```{r}
+# Extract the NASA data for the relevant variables
+nasa_data_relevant <- as.data.table(nasa_data)
+nasa_data_relevant <- nasa_data_relevant[, c("obs_date", "id", "Rainf_f_tavg", "Tair_f_inst", "Wind_f_inst")]
+
+# Convert the date column to date format
+nasa_data_relevant[, date := ymd_hms(obs_date)]
+
+# Set the time zone to UTC
+nasa_data_relevant[, date := with_tz(date, tzone = "UTC")]
+
+# Rename columns to match evap_data
+setnames(nasa_data_relevant, old = c("obs_date", "id", "Rainf_f_tavg", "Tair_f_inst", "Wind_f_inst"), new = c("obs_date", "id", "P", "Ta", "V"), skip_absent = TRUE)
+
+# Convert units to match evap_data
+nasa_data_relevant[id %in% evap_data$id == "P", P := P * 1000 / 86400]
+nasa_data_relevant[id %in% evap_data$id == "Ta", Ta := Ta - 273.15]
+nasa_data_relevant[id %in% evap_data$id == "V", V := V * 86400 / 1000]
+
+
+# Merge with evap_data to get the relevant dates
+evap_dates <- unique(evap_data[, c(2, 1)])
+nasa_data_merged <- nasa_data_relevant %>%
+  left_join(distinct(evap_dates, id, obs_date), by = "id", suffix = c(".x", ".y"))
+
+# Pivot the data to wide format
+nasa_data_wide <- dcast(nasa_data_merged, id + date ~ .,
+                        value.var = c("P", "Ta", "V"), fun.aggregate = mean)
+
+# Rename columns to match evap_data
+setnames(nasa_data_wide, c("id", "date", "P", "Ta", "V"), c("id", "obs_date", "P", "Ta", "V"))
+
+# Subset to relevant columns and rows
+nasa_data_final <- nasa_data_wide[, .(id, obs_date, P, Ta, V)]
+#nasa_data_final <- nasa_data_final[id %in% evap_data$id & obs_date %in% evap_data$obs_date]
+
+# Reorder columns to match evap_data
+nasa_data_final <- nasa_data_final[, .(id, obs_date, P, Ta, V)]
+
+# Set keys for data.tables
+setkey(nasa_data_final, id, obs_date)
+evap_data_dt <- as.data.table(evap_data)
+setkey(evap_data_dt, id, obs_date)
+
+common_cols <- intersect(colnames(nasa_data_final), colnames(evap_data_dt))
+nasa_data_final <- nasa_data_final[, ..common_cols]
+evap_data_dt <- evap_data_dt[, ..common_cols]
+
+nasa_data_final <- nasa_data_final %>%
+  anti_join(select(evap_data_dt, id, obs_date))
+
+evap_data_dt <- evap_data_dt %>%
+  anti_join(select(nasa_data_final, id, obs_date))
+
+# Validate the number of unique dates for each station in both data tables
+nasa_data_final[, .(unique_dates = uniqueN(obs_date)), by = id]
+evap_data_dt[, .(unique_dates = uniqueN(obs_date)), by = id]
+
+# Validate the length of the data
+stopifnot(nrow(nasa_data_final) == nrow(evap_data_dt))
+
+# Print the final data
+nasa_data_final
+```
+
+#TASK 6
+#The code is creating a function called "plot_regression" that takes two input arguments
+#- the observed and predicted values of a variable. The function first creates a scatter
+#plot of the observed vs. predicted values. It then adds a line of best fit to the plot and
+#annotates the plot with the R-squared value. Finally, it displays the plot. The function is
+#then called within a for loop that iterates over each station in the st_list, and for each station,
+#it loads the evap data, selects the relevant columns, splits the data into calibration and
+#validation sets based on observation dates, fits a linear regression model to the calibration data,
+#uses the model to predict the evap values for the validation data, and calls the "plot_regression"
+#function to create and display the plot.
+
+```{r}
+# Merge station information with observed data
+observed_data <- evap_data %>%
+  left_join(evap_st_info, by = "id") %>%
+  select(id, obs_date, group, PET, P, Ta, V, H, SSV)
+
+# Convert the list to a dataframe
+nasa_data_df <- bind_rows(nasa_data)
+
+# Rename the Qair_f_inst column to a more meaningful name
+nasa_data_df <- rename(nasa_data_df, H = Qair_f_inst)
+
+# Merge station information with NASA data
+nasa_data_df <- nasa_data_df %>%
+  left_join(evap_st_info, by = "id") %>%
+  select(id, obs_date, group, H)
+
+# Convert dates to POSIXct format
+observed_data$obs_date <- ymd(observed_data$obs_date)
+nasa_data_df$obs_date <- ymd_hms(nasa_data_df$obs_date)
+
+# Plot box plots comparing synthetic and observed variables for each station
+observed_data %>%
+  pivot_longer(cols = PET:SSV, names_to = "variable", values_to = "observed") %>%
+  ggplot(aes(x = variable, y = observed, fill = group)) +
+  geom_boxplot() +
+  facet_wrap(~id, nrow = 5) +
+  labs(title = "Comparison of Synthetic and Observed Variables for each Station",
+       x = "Variable", y = "Value", fill = "Station Group")
+
+# Assumptions on how the differences would impact the models’ output:
+# The differences between synthetic and observed variables could impact the accuracy of the models' output, as the models are built based on the observed data. If the synthetic data is significantly different from the observed data, the models may not accurately capture the underlying relationships between the variables.
+
+# Use appropriate models on NASA dataset to create simulations and describe the results
+# We will fit a linear regression model to predict potential evapotranspiration (PET) based on specific meteorological variables (Qair_f_inst, Ta, R, and V) from the NASA data.
+# We will use the observed data to train and validate the model, and then use the model to predict PET for the synthetic data.
+
+# Split the observed data into training and testing sets
+set.seed(123)
+train_indices <- sample(nrow(observed_data), 0.7 * nrow(observed_data))
+train_data <- observed_data[train_indices, ]
+test_data <- observed_data[-train_indices, ]
+
+# Fit a linear regression model to predict PET
+pet_model <- lm(PET ~ H + Ta + V, data = train_data)
+summary(pet_model)
+
+# Merge station information with NASA data
+nasa_data_df <- merge(nasa_data, evap_st_info, by = "id") %>%
+  select(id, obs_date, group, Qair_f_inst, Tair_f_inst, Wind_f_inst) %>%
+  mutate(Ta = Tair_f_inst, V = Wind_f_inst, R = 0)
+
+
+# Rename columns to match the variable names in the model
+colnames(nasa_data_df)[4] <- "H"
+colnames(nasa_data_df)[5] <- "Ta"
+colnames(nasa_data_df)[6] <- "V"
+
+# Make predictions on the test set
+test_data$predicted_PET <- predict(pet_model, newdata = test_data)
+
+# Calculate the ratio of mean predicted PET to observed PET on the test set
+mean_ratio <- mean(test_data$predicted_PET) / mean(test_data$PET)
+print(paste0("Ratio of Mean Predicted PET to Observed PET on Test Set: ", round(mean_ratio, 2)))
+
+# Use the trained model to predict PET for the synthetic data
+nasa_data_df$predicted_PET <- predict(pet_model, newdata = nasa_data_df)
+
+# Plot the predicted PET for the synthetic data
+nasa_data_df %>%
+  pivot_longer(cols = c(Ta, V, H),
+               names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = obs_date, y = value)) +
+  geom_line(aes(group = id)) +
+  facet_wrap(~variable, ncol = 3) +
+  labs(x = "Date", y = "Value") +
+  ggtitle("Observed Variables")
+
+#Merge observed and synthetic data
+evap_data_merged <- merge(evap_data, nasa_data_df, by = c("id", "obs_date"), all = TRUE)
+
+#Compare individual synthetic and observed variables for each station using box plots
+evap_data_long <- evap_data_merged %>%
+  pivot_longer(cols = c("PET", "P", "Ta.x", "Ta.y", "V.x", "V.y", "R", "H.x", "H.y", "SSV"),
+               names_to = c(".value", "source"),
+               names_sep = "\\.")
+
+evap_data_long %>%
+  ggplot(aes(x = id, y = PET, fill = source)) +
+  geom_boxplot() +
+  facet_wrap(~.value, scales = "free", ncol = 2, labeller = labeller(.value = c("observed" = "Observed", "synthetic" = "Synthetic"))) +
+  labs(x = "Station ID", y = "PET") +
+  ggtitle("Comparison of observed and synthetic PET")
+
+
+evap_data_long %>%
+  ggplot(aes(x = id, y = PET, fill = source)) +
+  geom_boxplot() +
+  facet_wrap(~.value, scales = "free") +
+  labs(x = "Station ID", y = "PET") +
+  ggtitle("Comparison of observed and synthetic PET")
+
+evap_data_long %>%
+  ggplot(aes(x = id, y = Ta, fill = source)) +
+  geom_boxplot() +
+  facet_wrap(~.value, scales = "free") +
+  labs(x = "Station ID", y = "Ta") +
+  ggtitle("Comparison of observed and synthetic Ta")
+
+evap_data_long %>%
+  ggplot(aes(x = id, y = P, fill = source)) +
+  geom_boxplot() +
+  facet_wrap(~.value, scales = "free") +
+  labs(x = "Station ID", y = "P") +
+  ggtitle("Comparison of observed and synthetic P")
+
+```
+
